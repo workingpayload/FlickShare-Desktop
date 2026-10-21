@@ -1,7 +1,8 @@
 name: Build Windows app
 
-# Push to main  -> test, build, and refresh the rolling "latest" pre-release.
-# Push a v* tag -> test, build, and publish a versioned release (e.g. v1.2.0).
+# Push to main  -> test, build, and publish release v<APP_VERSION> (flickshare_app/__init__.py).
+#                  Pushing again with the same version replaces that release's files.
+# Push a v* tag -> test, build, and publish that version (e.g. v1.2.0).
 # Pull requests / manual runs -> test and build; the exe is attached to the run as an artifact.
 on:
   push:
@@ -69,27 +70,33 @@ jobs:
           path: release/*
           if-no-files-found: error
 
-      - name: Publish versioned release
-        if: github.ref_type == 'tag'
+      - name: Publish release
+        if: github.event_name == 'push'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$TAG" release/* \
-            --title "FlickShare Desktop $TAG" \
-            --generate-notes \
-            --verify-tag
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            TAG="v$(python -c 'import flickshare_app as f; print(f.APP_VERSION)')"
+          fi
+          echo "Publishing $TAG"
 
-      - name: Refresh rolling "latest" pre-release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release delete latest --yes --cleanup-tag || true
-          gh release create latest release/* \
-            --prerelease \
-            --target "$GITHUB_SHA" \
-            --title "FlickShare Desktop (latest main build)" \
-            --notes "Automatic build of ${GITHUB_SHA::7} from main. Download **FlickShare.exe** (portable) or **FlickShare-windows.zip** (unzip and run FlickShare.exe; starts faster)."
+          # Remove the old rolling pre-release from earlier versions of this workflow.
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Same version pushed again: point the tag at this commit and replace the files.
+            if [ "$GITHUB_REF_TYPE" != tag ]; then
+              gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" -f sha="$GITHUB_SHA" -F force=true >/dev/null
+            fi
+            gh release upload "$TAG" release/* --clobber
+            gh release edit "$TAG" --prerelease=false --draft=false --latest
+          else
+            gh release create "$TAG" release/* \
+              --target "$GITHUB_SHA" \
+              --title "FlickShare Desktop $TAG" \
+              --generate-notes \
+              --latest
+          fi

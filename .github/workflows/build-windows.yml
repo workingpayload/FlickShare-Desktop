@@ -83,6 +83,9 @@ jobs:
           fi
           echo "Publishing $TAG"
 
+          # Release notes come from RELEASE.md, minus its "# title" line (the release has its own title).
+          sed '1{/^# /d}' RELEASE.md > "$RUNNER_TEMP/notes.md"
+
           # Remove the old rolling pre-release from earlier versions of this workflow.
           gh release delete latest --yes --cleanup-tag 2>/dev/null || true
 
@@ -92,11 +95,11 @@ jobs:
               gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" -f sha="$GITHUB_SHA" -F force=true >/dev/null
             fi
             gh release upload "$TAG" release/* --clobber
-            gh release edit "$TAG" --prerelease=false --draft=false --latest
+            gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md" --prerelease=false --draft=false --latest
           else
             gh release create "$TAG" release/* \
               --target "$GITHUB_SHA" \
               --title "FlickShare Desktop $TAG" \
-              --generate-notes \
+              --notes-file "$RUNNER_TEMP/notes.md" \
               --latest
           fi

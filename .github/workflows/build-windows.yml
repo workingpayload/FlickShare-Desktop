@@ -1,0 +1,95 @@
+name: Build Windows app
+
+# Push to main  -> test, build, and refresh the rolling "latest" pre-release.
+# Push a v* tag -> test, build, and publish a versioned release (e.g. v1.2.0).
+# Pull requests / manual runs -> test and build; the exe is attached to the run as an artifact.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pyinstaller
+
+      - name: Stamp version from tag
+        if: github.ref_type == 'tag'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $version = $env:TAG -replace '^v', ''
+          if ($version -notmatch '^\d+(\.\d+){0,3}([-+][0-9A-Za-z.-]+)?$') { throw "Tag '$env:TAG' is not a version like v1.2.0" }
+          $init = 'flickshare_app/__init__.py'
+          (Get-Content $init) -replace '^APP_VERSION = ".*"$', "APP_VERSION = `"$version`"" | Set-Content $init -Encoding utf8
+          Select-String -Path $init -Pattern '^APP_VERSION'
+
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+
+      - name: Build portable exe (one file)
+        run: ./build_exe.ps1 -SkipInstall -OneFile -Python python
+
+      - name: Build folder version (faster startup)
+        run: ./build_exe.ps1 -SkipInstall -Python python
+
+      - name: Package release files
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item dist/FlickShare.exe release/FlickShare.exe
+          Compress-Archive -Path dist/FlickShare -DestinationPath release/FlickShare-windows.zip -Force
+          Get-ChildItem release | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FlickShare-windows
+          path: release/*
+          if-no-files-found: error
+
+      - name: Publish versioned release
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" release/* \
+            --title "FlickShare Desktop $TAG" \
+            --generate-notes \
+            --verify-tag
+
+      - name: Refresh rolling "latest" pre-release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest release/* \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "FlickShare Desktop (latest main build)" \
+            --notes "Automatic build of ${GITHUB_SHA::7} from main. Download **FlickShare.exe** (portable) or **FlickShare-windows.zip** (unzip and run FlickShare.exe; starts faster)."

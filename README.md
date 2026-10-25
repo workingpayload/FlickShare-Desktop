@@ -4,7 +4,7 @@
 [![Latest release](https://img.shields.io/github/v/release/workingpayload/FlickShare-Desktop)](https://github.com/workingpayload/FlickShare-Desktop/releases/latest)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 
-The Windows receiver for **FlickShare**. Flick files, photos, videos, and links from your Android phone and they land on your PC over local Wi-Fi. No cloud, no account, no cable.
+The Windows app for **FlickShare**. Flick files, photos, videos, and links from your Android phone and they land on your PC over local Wi-Fi. Send files back the other way too: from this PC to phones and to other PCs running FlickShare. No cloud, no account, no cable.
 
 ---
 
@@ -34,17 +34,32 @@ On first start FlickShare checks Windows Firewall. If phones would be blocked, i
 
 No app on the phone? Scan the QR code in the window with any phone camera. It opens an upload page in the browser.
 
+### Sending from this PC (to phones and other PCs)
+
+Every FlickShare device (this app, and the Android app while it's open) runs the same receiver on port 8765. The **Send to nearby devices** card scans your Wi-Fi every 20 seconds and lists the phones and PCs it finds.
+
+- Drag files from Explorer onto a device in the list, or
+- select a device and click **Send files…** (double-click or right-click a device works too).
+
+The other device asks *"Accept files from <this PC>?"* the first time. Tick **Always accept files from this device** to skip the question next time. Can't see a device (different subnet, guest Wi-Fi)? Click **＋** and type its IP address. Phones only receive while the FlickShare app is open; they save to **Downloads**.
+
+When another phone or PC sends to *this* PC, you get the same Accept / Decline popup (it declines by itself after 2 minutes). Turn the question off, or forget trusted devices, in **Settings → Incoming files from other devices**. The browser upload page asks too.
+
+> Both apps must be updated together: with approvals on, an older FlickShare Android app (no handshake) gets *"Upload rejected"*.
+
 ## Features
 
 - **Status panel**: live/paused, LAN `IP:port` (one-click copy), PC name, mDNS state, Pause/Start and Restart. The receiver restarts by itself when your network address changes.
-- **Live transfer card**: progress, bytes, and speed for each incoming file.
+- **Live transfer card**: progress, bytes, and speed for each incoming file, with the sender's device name.
+- **Send to nearby devices**: finds other FlickShare phones and PCs on your Wi-Fi; drag files onto one (or use *Send files…*) to send. Shows *waiting for accept*, progress, speed, and Cancel.
+- **Accept / Decline popup** for files from devices you haven't trusted yet, with *Always accept files from this device*.
 - **History**: every received file. Double-click to open, *Show in folder*, *Copy path*, or remove (files stay on disk).
 - **QR code** for browser uploads from any phone.
 - **Folder drop zone**: drop a folder on the window to make it the save location.
 - **Liquid glass catch animation**: while the window is hidden, a glass drop rises from the screen edge, shows progress, then shows a thumbnail and the file name when the file lands. It comes in from the side opposite to your throw. You can turn it off in Settings.
 - **Firewall helper**: one-click fix if Windows Firewall blocks phones, including Block rules left behind by a cancelled Windows prompt and Wi-Fi marked *Public*.
 - **Tray app**: closing the window keeps it receiving in the background. Only one copy runs at a time.
-- **Settings**: save folder, port, mDNS, clipboard copy, notifications, animation, minimize to tray, start minimized, *Start with Windows*.
+- **Settings**: save folder, port, mDNS, clipboard copy, notifications, animation, ask before accepting files (and forget trusted devices), minimize to tray, start minimized, *Start with Windows*.
 
 Settings, history, and logs are stored in `%APPDATA%\FlickShare\` (`settings.json`, `history.json`, `flickshare.log`).
 
@@ -93,12 +108,15 @@ On Linux, `xclip` and `libnotify-bin` are needed for the clipboard and notificat
 | Endpoint | Description |
 | :--- | :--- |
 | `GET /` | Mobile-friendly browser upload page (what the QR code opens). |
-| `GET /health`, `GET /info` | Status plus hostname, IP, port, and save folder. |
-| `POST /upload` | `multipart/form-data` with one `file` part or several `files` parts. Streamed to disk in 1 MB chunks. |
+| `GET /health`, `GET /info` | Status plus hostname, IP, port, and save folder; protocol v2 adds `protocol`, `device_id`, `device_name`, `platform`, and `requires_approval`. |
+| `POST /transfer/request` | Handshake before an upload. JSON `{sender_id, sender_name, sender_platform, files:[{name,size,mime}], total_bytes}`. Returns `200 {"token": …}` at once for trusted senders (or when approvals are off); otherwise waits up to 120 s for the user: `403` declined, `408` (with `Retry-After`) no answer. |
+| `POST /upload` | `multipart/form-data` with one `file` part or several `files` parts. Streamed to disk in 1 MB chunks. When the receiver requires approval, send the one-time token as `X-FlickShare-Token` (single use, 10 minutes, same IP), otherwise `403`. |
 
 ```bash
 curl -X POST http://192.168.1.42:8765/upload -F "files=@screenshot.png" -F "files=@notes.txt"
 ```
+
+The command-line `server.py` doesn't ask (approvals are off), so the `curl` above works as is. Optional sender headers `X-FlickShare-Sender-Id`, `X-FlickShare-Sender-Platform`, and `X-FlickShare-Sender-Name` (percent-encoded UTF-8) put a friendly name in the transfer card and history.
 
 Optional header `X-FlickShare-Direction: <deg>` (−90…90; negative means thrown to the left) sets which side the glass animation comes in from.
 

@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+from typing import Dict, List
 
 from flickshare_app import APP_NAME
 
@@ -46,6 +47,11 @@ class AppSettings:
     autostart: bool = False
     tray_hint_shown: bool = False
     firewall_dont_ask: bool = False
+    # Ask before accepting files from devices that aren't in `trusted_devices` (device_id -> name).
+    require_approval: bool = True
+    trusted_devices: Dict[str, str] = field(default_factory=dict)
+    # Extra "host:port" targets probed on every device scan (devices outside this PC's /24).
+    manual_peers: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.save_dir:
@@ -56,6 +62,14 @@ class AppSettings:
             self.port = 8765
         if not MIN_PORT <= self.port <= MAX_PORT:
             self.port = 8765
+        if not isinstance(self.trusted_devices, dict):
+            self.trusted_devices = {}
+        self.trusted_devices = {
+            str(k): str(v) for k, v in self.trusted_devices.items() if isinstance(k, str) and k
+        }
+        if not isinstance(self.manual_peers, list):
+            self.manual_peers = []
+        self.manual_peers = list(dict.fromkeys(str(p).strip() for p in self.manual_peers if str(p).strip()))
 
     @property
     def save_path(self) -> Path:

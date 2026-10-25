@@ -314,3 +314,131 @@ def test_browser_upload_page_escapes_hostname(temp_receiver):
     assert "&lt;b&gt;pc&lt;/b&gt;" in response.text
     assert "<b>pc</b>" not in response.text
 
+
+# ---------------------------------------------------------------------------
+# 6. Protocol v2: device identity, transfer approval handshake, upload tokens
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def approval_receiver(temp_receiver):
+    cfg = server.config
+    saved = (cfg.require_approval, cfg.trusted_devices, cfg.approval_timeout_s)
+    cfg.require_approval = True
+    cfg.trusted_devices = set()
+    yield temp_receiver
+    cfg.require_approval, cfg.trusted_devices, cfg.approval_timeout_s = saved
+
+
+def request_transfer(client, sender_id="phone-1"):
+    body = {
+        "sender_id": sender_id,
+        "sender_name": "Pixel 8",
+        "sender_platform": "android",
+        "files": [{"name": "a.txt", "size": 3, "mime": "text/plain"}],
+        "total_bytes": 3,
+    }
+    return client.post("/transfer/request", json=body)
+
+
+def upload_with_token(client, token=None, headers=None):
+    headers = dict(headers or {})
+    if token:
+        headers["X-FlickShare-Token"] = token
+    return client.post(
+        "/upload", files={"file": ("a.txt", io.BytesIO(b"abc"), "text/plain")}, headers=headers
+    )
+
+
+def test_info_advertises_protocol_v2_identity(temp_receiver):
+    client, _ = temp_receiver
+    info = client.get("/info").json()
+    assert info["protocol"] == 2
+    assert info["device_id"] == server.config.device_id and len(info["device_id"]) >= 16
+    assert info["device_name"] == server.config.device_name
+    assert info["platform"] == server.platform_name()
+    assert info["requires_approval"] is False
+
+
+def test_without_approval_any_sender_gets_token_and_name_is_reported(temp_receiver, captured_events):
+    client, _ = temp_receiver
+    response = request_transfer(client)
+    assert response.status_code == 200
+    assert response.json()["status"] == "accepted" and response.json()["token"]
+    assert not [n for n, _ in captured_events if n == "transfer_request"]
+
+    # Tokens are optional while approvals are off (v1 clients keep working).
+    sender = {"X-FlickShare-Sender-Name": "Jos%C3%A9%27s%20PC", "X-FlickShare-Sender-Platform": "windows"}
+    assert upload_with_token(client, headers=sender).status_code == 200
+    started = next(p for n, p in captured_events if n == "transfer_started")
+    completed = next(p for n, p in captured_events if n == "transfer_completed")
+    assert started["sender_name"] == completed["sender_name"] == "José's PC"
+    assert started["sender_platform"] == "windows"
+
+
+def test_upload_needs_a_single_use_token_when_approval_required(approval_receiver, captured_events):
+    client, tmp_path = approval_receiver
+    response = upload_with_token(client)
+    assert response.status_code == 403
+    assert upload_with_token(client, token="forged").status_code == 403
+    assert captured_events == []  # rejected before any transfer UI events
+    assert not list(tmp_path.iterdir())
+
+    server.config.trusted_devices = {"phone-1"}
+    grant = request_transfer(client)
+    assert grant.status_code == 200 and grant.json()["trusted"] is True
+    token = grant.json()["token"]
+    assert upload_with_token(client, token=token).status_code == 200
+    assert (tmp_path / "a.txt").read_bytes() == b"abc"
+    completed = next(p for n, p in captured_events if n == "transfer_completed")
+    assert completed["sender_name"] == "Pixel 8"
+    assert upload_with_token(client, token=token).status_code == 403  # token reuse
+
+
+def test_untrusted_request_waits_for_the_users_answer(approval_receiver, captured_events):
+    client, _ = approval_receiver
+    answers = iter([(True, True), (False, False)])
+
+    def answer(name, payload):
+        if name == "transfer_request":
+            accepted, trust = next(answers)
+            assert server.resolve_transfer_request(payload["request_id"], accepted, trust)
+
+    server.add_event_listener(answer)
+    try:
+        accepted = request_transfer(client)
+        declined = request_transfer(client, sender_id="phone-2")
+    finally:
+        server.remove_event_listener(answer)
+
+    assert accepted.status_code == 200 and accepted.json()["token"]
+    assert accepted.json()["trusted"] is True
+    assert server.config.trusted_devices == {"phone-1"}
+    assert declined.status_code == 403 and "declined" in declined.json()["detail"]
+
+    prompt = next(p for n, p in captured_events if n == "transfer_request")
+    assert prompt["sender_name"] == "Pixel 8" and prompt["sender_platform"] == "android"
+    assert prompt["file_count"] == 1 and prompt["total_bytes"] == 3
+    assert prompt["files"] == [{"name": "a.txt", "size": 3}]
+    assert not [n for n, _ in captured_events if n == "transfer_request_closed"]
+    assert upload_with_token(client, token=accepted.json()["token"]).status_code == 200
+
+
+def test_unanswered_request_times_out_with_retry_after(approval_receiver, captured_events):
+    client, _ = approval_receiver
+    server.config.approval_timeout_s = 0.3
+    response = request_transfer(client)
+    assert response.status_code == 408
+    assert int(response.headers["Retry-After"]) > 0  # stops OkHttp from silently retrying
+    prompt = next(p for n, p in captured_events if n == "transfer_request")
+    closed = next(p for n, p in captured_events if n == "transfer_request_closed")
+    assert closed == {"request_id": prompt["request_id"], "reason": "timeout"}
+    assert server.resolve_transfer_request(prompt["request_id"], True) is False
+
+
+def test_transfer_request_rejects_non_object_body(temp_receiver):
+    client, _ = temp_receiver
+    assert client.post("/transfer/request", json=["nope"]).status_code == 400
+    assert client.post(
+        "/transfer/request", content=b"{bad", headers={"Content-Type": "application/json"}
+    ).status_code == 400

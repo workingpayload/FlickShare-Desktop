@@ -84,6 +84,16 @@ QTreeWidget {{
 QTreeWidget::item {{ padding: 6px 4px; border: none; }}
 QTreeWidget::item:selected {{ background: #2B2550; color: {TEXT}; }}
 QTreeWidget::item:hover {{ background: {SURFACE_2}; }}
+QListWidget#Devices {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 10px;
+    outline: 0;
+    padding: 4px;
+}}
+QListWidget#Devices::item {{ padding: 7px 8px; border-radius: 8px; }}
+QListWidget#Devices::item:selected {{ background: #2B2550; color: {TEXT}; }}
+QListWidget#Devices::item:hover {{ background: {SURFACE_2}; }}
 QHeaderView::section {{
     background: {SURFACE};
     color: {MUTED};

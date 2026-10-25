@@ -34,6 +34,8 @@ from PySide6.QtWidgets import (
 
 import server
 from flickshare_app import APP_NAME, autostart, firewall, theme
+from flickshare_app.approval_dialog import ApprovalDialog
+from flickshare_app.devices_panel import DevicesCard
 from flickshare_app.glass_overlay import LiquidGlassOverlay
 from flickshare_app.history import HistoryStore, ReceivedFile
 from flickshare_app.icons import app_icon
@@ -73,6 +75,11 @@ def format_when(timestamp: float) -> str:
     return when.strftime("%d %b %H:%M")
 
 
+def sender_label(payload: Dict[str, Any], default: str = "?") -> str:
+    """Friendly sender name from a receiver event (falls back to the client IP)."""
+    return str(payload.get("sender_name") or payload.get("client") or default)
+
+
 class MainWindow(QMainWindow):
     def __init__(
         self,
@@ -87,6 +94,7 @@ class MainWindow(QMainWindow):
         self._quitting = False
         self._active_transfers: Set[str] = set()
         self._last_caught: Optional[Path] = None
+        self._approvals: Dict[str, ApprovalDialog] = {}
         self._icon_provider = QFileIconProvider()
         self._icon_on = app_icon(True)
         self._icon_off = app_icon(False)
@@ -100,8 +108,8 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(self._icon_on)
-        self.resize(1000, 700)
-        self.setMinimumSize(860, 660)
+        self.resize(1040, 780)
+        self.setMinimumSize(900, 720)
 
         root = QWidget()
         root.setObjectName("Root")
@@ -130,6 +138,10 @@ class MainWindow(QMainWindow):
 
         right = QVBoxLayout()
         right.setSpacing(16)
+        self.devices_card = DevicesCard(settings.manual_peers)
+        self.devices_card.notify.connect(self._notify)
+        self.devices_card.manual_peers_changed.connect(self._on_manual_peers_changed)
+        right.addWidget(self.devices_card)
         self.transfer_card = TransferCard()
         right.addWidget(self.transfer_card)
         right.addWidget(self._build_history_card(), 1)
@@ -159,7 +171,7 @@ class MainWindow(QMainWindow):
         titles = QVBoxLayout()
         titles.setSpacing(0)
         titles.addWidget(make_label(APP_NAME, "Title"))
-        titles.addWidget(make_label("Desktop receiver · catch files flicked from your phone", "Muted"))
+        titles.addWidget(make_label("Send and catch files between your phones and PCs", "Muted"))
         row.addLayout(titles, 1)
         settings_btn = QPushButton("⚙  Settings")
         settings_btn.clicked.connect(self.open_settings)
@@ -316,6 +328,8 @@ class MainWindow(QMainWindow):
             save_dir=s.save_dir,
             enable_mdns=s.enable_mdns,
             enable_clipboard=s.enable_clipboard,
+            require_approval=s.require_approval,
+            trusted_devices=s.trusted_devices.keys(),
         )
         if not ok and self.controller.status.error:
             self._notify("Receiver not started", self.controller.status.error)
@@ -400,6 +414,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, APP_NAME, f"Could not update Windows Firewall:\n{error}")
 
     def stop_receiver(self) -> None:
+        self._dismiss_approvals()
         self.controller.stop()
         self._active_transfers.clear()
 
@@ -473,9 +488,17 @@ class MainWindow(QMainWindow):
 
     def _on_receiver_event(self, event: str, payload: Dict[str, Any]) -> None:
         transfer_id = str(payload.get("transfer_id") or "")
-        if event == "transfer_started":
+        if event == "transfer_request":
+            self._show_approval(payload)
+        elif event == "transfer_request_closed":
+            dialog = self._approvals.pop(str(payload.get("request_id") or ""), None)
+            if dialog is not None:
+                dialog.dismiss()
+                if payload.get("reason") == "timeout":
+                    self._notify("Request expired", f"{dialog.sender_name} stopped waiting for an answer.")
+        elif event == "transfer_started":
             self._active_transfers.add(transfer_id)
-            client = str(payload.get("client", "?"))
+            client = sender_label(payload)
             total = int(payload.get("total_bytes", 0))
             self.transfer_card.transfer_started(transfer_id, client, total)
             if self._glass_wanted():
@@ -494,12 +517,12 @@ class MainWindow(QMainWindow):
         elif event == "transfer_failed":
             self._active_transfers.discard(transfer_id)
             error = str(payload.get("error", "unknown error"))
-            self.transfer_card.transfer_finished(
-                transfer_id, False, f"From {payload.get('client', '?')}: {error}"
-            )
-            self.glass.transfer_finished(transfer_id, False, "Throw didn't land", error, f"from {payload.get('client', '?')}")
+            sender = sender_label(payload)
+            self.transfer_card.transfer_finished(transfer_id, False, f"From {sender}: {error}")
+            self.glass.transfer_finished(transfer_id, False, "Throw didn't land", error, f"from {sender}")
         elif event == "server_stopped":
             self._active_transfers.clear()
+            self._dismiss_approvals()
             self.glass.dismiss()
             error = str(payload.get("error") or "Receiver stopped")
             self.controller.mark_stopped(error)
@@ -507,7 +530,7 @@ class MainWindow(QMainWindow):
 
     def _on_transfer_completed(self, transfer_id: str, payload: Dict[str, Any]) -> None:
         files = payload.get("files") or []
-        client = str(payload.get("client", "unknown"))
+        client = sender_label(payload, "unknown")
         speed = float(payload.get("speed_mbps", 0.0))
         for entry in files:
             self.history.add(
@@ -541,6 +564,50 @@ class MainWindow(QMainWindow):
     def _glass_wanted(self) -> bool:
         window_open = self.isVisible() and not self.isMinimized()
         return self.settings.glass_overlay and not window_open
+
+    # ------------------------------------------------------------------ approvals
+
+    def _show_approval(self, payload: Dict[str, Any]) -> None:
+        request_id = str(payload.get("request_id") or "")
+        if not request_id or request_id in self._approvals:
+            return
+        dialog = ApprovalDialog(payload)
+        dialog.setWindowIcon(self._icon_on)
+        dialog.decided.connect(self._on_approval_decided)
+        self._approvals[request_id] = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        QApplication.alert(dialog)
+        if not (self.isVisible() and not self.isMinimized()):
+            count = int(payload.get("file_count") or 0)
+            self._notify(
+                f"{dialog.sender_name} wants to send files",
+                f"{count} file{'s' if count != 1 else ''} · accept or decline in the popup",
+            )
+
+    def _on_approval_decided(self, request_id: str, accepted: bool, trust: bool) -> None:
+        dialog = self._approvals.pop(request_id, None)
+        if not server.resolve_transfer_request(request_id, accepted, trust):
+            if accepted:
+                self._notify("Too late", "That device stopped waiting. Ask it to send again.")
+            return
+        if accepted and trust and dialog is not None and dialog.sender_id:
+            trusted = dict(self.settings.trusted_devices)
+            trusted[dialog.sender_id] = dialog.sender_name
+            self.settings = replace(self.settings, trusted_devices=trusted)
+            self._save_settings()
+            self.controller.set_approval(self.settings.require_approval, trusted.keys())
+
+    def _dismiss_approvals(self) -> None:
+        dialogs = list(self._approvals.values())
+        self._approvals.clear()
+        for dialog in dialogs:
+            dialog.dismiss()
+
+    def _on_manual_peers_changed(self, peers: list) -> None:
+        self.settings = replace(self.settings, manual_peers=list(peers))
+        self._save_settings()
 
     # ------------------------------------------------------------------ history
 
@@ -636,7 +703,7 @@ class MainWindow(QMainWindow):
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec() != SettingsDialog.DialogCode.Accepted:
             return
-        self.apply_settings(dialog.result_settings())
+        self.apply_settings(dialog.result_settings(self.settings))
 
     def apply_settings(self, new: AppSettings) -> None:
         old = self.settings
@@ -649,6 +716,7 @@ class MainWindow(QMainWindow):
 
         server.config.save_dir = new.save_path
         self.controller.set_clipboard_enabled(new.enable_clipboard)
+        self.controller.set_approval(new.require_approval, new.trusted_devices.keys())
         if not new.glass_overlay:
             self.glass.dismiss()
         needs_restart = new.port != old.port or new.enable_mdns != old.enable_mdns
@@ -730,6 +798,8 @@ class MainWindow(QMainWindow):
             return
         self._quitting = True
         self._network_timer.stop()
+        self._dismiss_approvals()
+        self.devices_card.cancel_send()
         self.glass.close()
         self.controller.shutdown()
         self.history.save()

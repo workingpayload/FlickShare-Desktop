@@ -1,6 +1,6 @@
-# FlickShare Desktop v1.0.0
+# FlickShare Desktop v1.1.0
 
-First release of the FlickShare Windows receiver. Flick files from your Android phone straight onto your PC over local Wi-Fi.
+Share files between any of your devices: phone to PC, PC to phone, PC to PC, and phone to phone. Everything stays on your local Wi-Fi.
 
 ## Downloads
 
@@ -11,19 +11,26 @@ First release of the FlickShare Windows receiver. Flick files from your Android 
 
 Windows 10/11, 64-bit. The exe isn't code-signed, so SmartScreen may warn: click **More info → Run anyway**.
 
-## What's in it
+## New in 1.1.0
 
-- **Receive from phone**: files, photos, videos, and links from the FlickShare Android app. The PC is found automatically over mDNS, with no pairing.
+- **Send to nearby devices**: a new card lists the phones and PCs running FlickShare on your Wi-Fi. Drag files onto one, or pick a device and click **Send files…**. Progress, speed, and Cancel are shown while it sends.
+- **Accept or decline**: the first time a phone or PC sends you files, FlickShare asks before saving anything. Tick **Always accept files from this device** to skip the question next time. Manage this in **Settings → Incoming files from other devices**.
+- **Add a device by IP** for devices the scan can't reach (other subnets, some guest networks).
+- Incoming transfers and the history show the **sender's device name** instead of an IP address.
+
+> **Update the FlickShare Android app too.** Phones need the new app version to send to this PC (older versions get *"Upload rejected"*) and to receive files. Phones receive while the app is open and save to **Downloads**.
+
+## Also included (from 1.0)
+
+- **Receive from phone**: files, photos, videos, and links from the FlickShare Android app. The PC is found automatically, with no pairing.
 - **Browser upload**: scan the QR code with any phone camera to send files without the app.
 - **Saved and ready to paste**: files go to your Desktop (or a folder you choose) and are copied to the clipboard.
-- **Live transfer progress** and a **history** of received files (open, show in folder, copy path).
 - **Liquid glass catch animation** when the window is hidden. It comes in from the side opposite to your throw.
-- **Firewall helper**: FlickShare checks Windows Firewall when it starts and can allow itself with one admin prompt. It also fixes leftover Block rules and Wi-Fi marked *Public*. No manual port setup.
+- **Firewall helper**: FlickShare checks Windows Firewall when it starts and can allow itself with one admin prompt.
 - **Tray app**: keeps receiving in the background, with optional *Start with Windows* and start minimized.
-- **Settings**: save folder, port, mDNS, clipboard, notifications, animation.
 
 ## Getting started
 
 1. Run `FlickShare.exe`.
 2. If asked **"Allow FlickShare?"**, click **Allow** and approve the admin prompt.
-3. Open the FlickShare app on your phone (same Wi-Fi) and flick a file.
+3. Open the FlickShare app on your phone (same Wi-Fi) and flick a file, or drag a file from this PC onto your phone in **Send to nearby devices**.

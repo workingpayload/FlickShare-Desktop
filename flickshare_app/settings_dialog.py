@@ -74,6 +74,21 @@ class SettingsDialog(QDialog):
         for box in (self.mdns, self.clipboard, self.notifications, self.glass):
             root.addWidget(box)
 
+        root.addWidget(make_label("Incoming files from other devices", "CardTitle"))
+        self.require_approval = QCheckBox("Ask me before accepting files from a new phone or PC (recommended)")
+        self.require_approval.setChecked(settings.require_approval)
+        root.addWidget(self.require_approval)
+        self._forget_trusted = False
+        trusted_row = QHBoxLayout()
+        self.trusted_label = make_label("", "Muted", wrap=True)
+        trusted_row.addWidget(self.trusted_label, 1)
+        self.forget_btn = QPushButton("Forget all")
+        self.forget_btn.setToolTip("Ask again next time any of these devices sends files")
+        self.forget_btn.clicked.connect(self._forget_all)
+        trusted_row.addWidget(self.forget_btn)
+        root.addLayout(trusted_row)
+        self._update_trusted_label()
+
         root.addWidget(make_label("App", "CardTitle"))
         self.tray = QCheckBox("Keep running in the system tray when the window is closed")
         self.tray.setChecked(settings.minimize_to_tray)
@@ -99,6 +114,19 @@ class SettingsDialog(QDialog):
         if folder:
             self.save_dir.setText(str(Path(folder)))
 
+    def _update_trusted_label(self) -> None:
+        names = [] if self._forget_trusted else sorted(self._original.trusted_devices.values(), key=str.lower)
+        if names:
+            shown = ", ".join(names[:6]) + (f" and {len(names) - 6} more" if len(names) > 6 else "")
+            self.trusted_label.setText(f"Always accepted: {shown}")
+        else:
+            self.trusted_label.setText("No trusted devices yet.")
+        self.forget_btn.setEnabled(bool(names))
+
+    def _forget_all(self) -> None:
+        self._forget_trusted = True
+        self._update_trusted_label()
+
     def _accept(self) -> None:
         folder = Path(self.save_dir.text().strip()).expanduser()
         if not self.save_dir.text().strip():
@@ -112,9 +140,11 @@ class SettingsDialog(QDialog):
         self.save_dir.setText(str(folder))
         self.accept()
 
-    def result_settings(self) -> AppSettings:
+    def result_settings(self, base: Optional[AppSettings] = None) -> AppSettings:
+        """Dialog values applied on top of `base` (the app's current settings; defaults to the opening ones)."""
+        base = base or self._original
         return replace(
-            self._original,
+            base,
             save_dir=self.save_dir.text().strip(),
             port=self.port.value(),
             enable_mdns=self.mdns.isChecked(),
@@ -124,4 +154,6 @@ class SettingsDialog(QDialog):
             minimize_to_tray=self.tray.isChecked(),
             start_minimized=self.start_min.isChecked(),
             autostart=self.autostart.isChecked(),
+            require_approval=self.require_approval.isChecked(),
+            trusted_devices={} if self._forget_trusted else dict(base.trusted_devices),
         )

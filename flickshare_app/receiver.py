@@ -9,7 +9,7 @@ import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 import uvicorn
 from PySide6.QtCore import QObject, Signal
@@ -74,6 +74,8 @@ class ReceiverController(QObject):
         enable_mdns: bool,
         enable_clipboard: bool,
         host: str = "0.0.0.0",
+        require_approval: bool = False,
+        trusted_devices: Iterable[str] = (),
     ) -> bool:
         with self._lock:
             if self.is_running:
@@ -85,6 +87,8 @@ class ReceiverController(QObject):
             cfg.save_dir = Path(save_dir).expanduser()
             cfg.enable_mdns = enable_mdns
             cfg.enable_clipboard = enable_clipboard
+            cfg.require_approval = require_approval
+            cfg.trusted_devices = set(trusted_devices)
             # The GUI shows its own tray notifications instead of spawning PowerShell toasts.
             cfg.enable_notifications = False
             server.app.state.config = cfg
@@ -148,6 +152,7 @@ class ReceiverController(QObject):
             self.receiver_event.emit("server_stopped", {"error": error or "Receiver stopped"})
 
     def stop(self, timeout: float = 5.0) -> None:
+        server.decline_pending_requests()
         with self._lock:
             uv_server, thread = self._server, self._thread
             if uv_server is not None:
@@ -163,6 +168,10 @@ class ReceiverController(QObject):
 
     def set_clipboard_enabled(self, enabled: bool) -> None:
         server.config.enable_clipboard = enabled
+
+    def set_approval(self, require_approval: bool, trusted_devices: Iterable[str]) -> None:
+        server.config.require_approval = require_approval
+        server.config.trusted_devices = set(trusted_devices)
 
     def mark_stopped(self, error: str) -> None:
         with self._lock:

@@ -265,3 +265,171 @@ def test_firewall_scripts_quote_paths_and_reject_bad_ports(tmp_path: Path):
     assert "Domain,Private,Public" in public and "Set-NetConnectionProfile" not in public
     with pytest.raises(ValueError):
         build_check_script(70000, program)
+
+
+# ---------------------------------------------------------------------------
+# Nearby devices: discovery + sending to other FlickShare devices (protocol v2)
+# ---------------------------------------------------------------------------
+
+
+def test_settings_roundtrip_trust_and_manual_peers(isolated_app_dir: Path):
+    AppSettings(
+        require_approval=False, trusted_devices={"abc": "Pixel 8"}, manual_peers=["10.0.0.2", " 10.0.0.2 ", ""]
+    ).save()
+    loaded = AppSettings.load()
+    assert loaded.require_approval is False
+    assert loaded.trusted_devices == {"abc": "Pixel 8"}
+    assert loaded.manual_peers == ["10.0.0.2"]
+
+    (isolated_app_dir / "settings.json").write_text(
+        json.dumps({"trusted_devices": ["abc"], "manual_peers": "10.0.0.2"}), encoding="utf-8"
+    )
+    loaded = AppSettings.load()
+    assert loaded.trusted_devices == {} and loaded.manual_peers == []
+    assert AppSettings().require_approval is True
+
+
+def test_peer_from_info_handles_v2_v1_and_garbage():
+    from flickshare_app.peers import peer_from_info
+
+    phone = peer_from_info(
+        "192.168.1.7",
+        8765,
+        {"status": "ok", "protocol": 2, "device_id": "p1", "device_name": "Pixel\n8", "platform": "Android"},
+    )
+    assert phone is not None and phone.is_phone and phone.protocol == 2
+    assert (phone.device_id, phone.name, phone.platform, phone.address) == ("p1", "Pixel8", "android", "192.168.1.7:8765")
+
+    old_pc = peer_from_info("192.168.1.9", 8765, {"status": "ok", "hostname": "OLD-PC"})
+    assert old_pc is not None and not old_pc.is_phone
+    assert (old_pc.device_id, old_pc.name, old_pc.platform, old_pc.protocol) == ("ip:192.168.1.9", "OLD-PC", "windows", 1)
+
+    for junk in (None, [], {"status": "down"}, "ok"):
+        assert peer_from_info("1.2.3.4", 8765, junk) is None
+
+
+def test_parse_host_and_subnet_hosts():
+    from flickshare_app.peers import parse_host, subnet_hosts
+
+    assert parse_host(" 192.168.1.5 ") == ("192.168.1.5", 8765)
+    assert parse_host("http://10.0.0.2:9000/upload") == ("10.0.0.2", 9000)
+    for bad in ("", "bad host", "1.2.3.4:99999", "1.2.3.4:abc"):
+        assert parse_host(bad) is None
+
+    hosts = subnet_hosts("192.168.1.10")
+    assert len(hosts) == 253 and "192.168.1.10" not in hosts
+    assert hosts[0] == "192.168.1.1" and hosts[-1] == "192.168.1.254"
+    for not_lan in ("127.0.0.1", "8.8.8.8", "nonsense", "::1"):
+        assert subnet_hosts(not_lan) == []
+
+
+def test_scan_network_skips_self_dedupes_and_lists_phones_first():
+    from flickshare_app.peers import Peer, scan_network
+
+    found = {
+        "10.0.0.2": Peer("me", "This PC", "windows", "10.0.0.2", 8765, 2),
+        "10.0.0.3": Peer("pc", "Zed PC", "windows", "10.0.0.3", 8765, 2),
+        "10.0.0.4": Peer("phone", "Pixel", "android", "10.0.0.4", 8765, 2),
+        "10.0.0.5": Peer("phone", "Pixel", "android", "10.0.0.5", 8765, 2),  # second interface
+        "172.16.0.9": Peer("far", "Office PC", "windows", "172.16.0.9", 9000, 2),
+    }
+    probed = []
+
+    def fake_probe(host, port, timeout):
+        probed.append((host, port))
+        return found.get(host)
+
+    peers = scan_network("10.0.0.2", "me", extra_hosts=[("172.16.0.9", 9000)], probe=fake_probe)
+    assert [p.device_id for p in peers] == ["phone", "far", "pc"]
+    assert ("172.16.0.9", 9000) in probed and ("10.0.0.2", 8765) not in probed
+    assert scan_network("127.0.0.1", "me", probe=fake_probe) == []
+
+
+def test_multipart_layout_length_matches_body(tmp_path: Path):
+    from flickshare_app.peers import OutgoingFile, multipart_layout
+
+    paths = [tmp_path / "plain.txt", tmp_path / "café ☕.bin"]
+    paths[0].write_bytes(b"hello")
+    paths[1].write_bytes(bytes(range(256)) * 4)
+    files = [OutgoingFile(paths[0], 'a"b.txt', 5, "text/plain"), OutgoingFile.from_path(paths[1])]
+    heads, tail, length = multipart_layout(files, "XYZ")
+    body = b"".join(h + f.path.read_bytes() + b"\r\n" for h, f in zip(heads, files)) + tail
+    assert len(body) == length
+    assert b'filename="a%22b.txt"' in heads[0]
+    assert "café ☕.bin".encode("utf-8") in heads[1]
+
+
+@pytest.fixture
+def live_receiver(tmp_path: Path, monkeypatch):
+    """The real receiver (uvicorn on a thread) on a free localhost port, approvals on."""
+    import time
+
+    import server
+    from flickshare_app.peers import probe_peer
+    from flickshare_app.receiver import ReceiverController
+
+    for name in (
+        "host", "port", "save_dir", "enable_mdns", "enable_clipboard",
+        "enable_notifications", "require_approval", "trusted_devices",
+    ):
+        monkeypatch.setattr(server.config, name, getattr(server.config, name))
+    free = bind_listen_socket("127.0.0.1", 0)
+    port = free.getsockname()[1]
+    free.close()
+    inbox = tmp_path / "inbox"
+    controller = ReceiverController()
+    assert controller.start(
+        port=port, save_dir=str(inbox), enable_mdns=False, enable_clipboard=False,
+        host="127.0.0.1", require_approval=True,
+    )
+    deadline = time.monotonic() + 15
+    while probe_peer("127.0.0.1", port, 0.5) is None:
+        assert time.monotonic() < deadline, "receiver did not start"
+        time.sleep(0.05)
+    try:
+        yield port, inbox
+    finally:
+        controller.shutdown()
+
+
+def test_file_sender_handshake_and_upload_end_to_end(live_receiver, tmp_path: Path):
+    import server
+    from flickshare_app.peers import FileSender, Identity, SendError, probe_peer
+
+    port, inbox = live_receiver
+    peer = probe_peer("127.0.0.1", port)
+    assert peer is not None and peer.protocol == 2 and peer.requires_approval
+
+    first, second = tmp_path / "café ☕.txt", tmp_path / "big.bin"
+    first.write_text("bonjour", encoding="utf-8")
+    second.write_bytes(b"\x01" * (3 * 1024 * 1024 + 7))
+    identity = Identity("sender-1", "Test Laptop", "windows")
+    answers = iter([True, False])
+    prompts = []
+
+    def answer(name, payload):
+        if name == "transfer_request":
+            prompts.append(payload)
+            server.resolve_transfer_request(payload["request_id"], next(answers))
+
+    states, progress = [], []
+    server.add_event_listener(answer)
+    try:
+        sender = FileSender(
+            peer, [first, second], identity, on_state=states.append,
+            on_progress=lambda sent, total, name, elapsed: progress.append((sent, total)),
+        )
+        result = sender.run()
+        with pytest.raises(SendError, match="declined"):
+            FileSender(peer, [first], identity).run()
+    finally:
+        server.remove_event_listener(answer)
+
+    assert states == ["waiting", "sending"]
+    assert progress[-1] == (sender.total_bytes, sender.total_bytes)
+    assert result["status"] == "ok" and len(result["files"]) == 2
+    assert (inbox / "café ☕.txt").read_text(encoding="utf-8") == "bonjour"
+    assert (inbox / "big.bin").read_bytes() == second.read_bytes()
+    assert prompts[0]["sender_name"] == "Test Laptop" and prompts[0]["file_count"] == 2
+    assert prompts[0]["total_bytes"] == sender.total_bytes
+    assert not (inbox / "café ☕_1.txt").exists()  # declined send wrote nothing

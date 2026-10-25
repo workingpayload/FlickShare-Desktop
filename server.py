@@ -14,26 +14,30 @@ from __future__ import annotations
 import argparse
 import asyncio
 import html
+import json
 import logging
 import math
 import os
 import platform
 import re
+import secrets
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from urllib.parse import unquote
 
 import pyperclip
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from PIL import Image
 from zeroconf import IPVersion, ServiceInfo
 from zeroconf.asyncio import AsyncZeroconf
@@ -44,6 +48,9 @@ from zeroconf.asyncio import AsyncZeroconf
 
 SERVICE_TYPE = "_flickshare._tcp.local."
 DEFAULT_PORT = 8765
+PROTOCOL_VERSION = 2
+APPROVAL_TIMEOUT_S = 120.0
+TOKEN_TTL_S = 600.0
 CHUNK_SIZE = 1024 * 1024  # 1 MB streaming buffer
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"}
 WINDOWS_RESERVED_NAMES = {
@@ -92,6 +99,24 @@ def emit_event(event: str, **payload: Any) -> None:
             logger.debug("Event listener failed for %s: %s", event, exc)
 
 
+def get_clean_hostname() -> str:
+    """Return a clean, mDNS-safe machine hostname."""
+    raw = socket.gethostname() or "Desktop"
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "-", raw).strip("-")
+    return cleaned or "Desktop"
+
+
+def default_device_id() -> str:
+    """Stable 32-hex device id derived from the hostname and MAC (no storage needed)."""
+    seed = f"flickshare:{socket.gethostname()}:{uuid.getnode():012x}"
+    return uuid.uuid5(uuid.NAMESPACE_DNS, seed).hex
+
+
+def platform_name() -> str:
+    system = platform.system().lower()
+    return {"darwin": "macos"}.get(system, system or "unknown")
+
+
 # ---------------------------------------------------------------------------
 # Receiver Configuration
 # ---------------------------------------------------------------------------
@@ -117,6 +142,16 @@ class ReceiverConfig:
     enable_notifications: bool = field(
         default_factory=lambda: os.environ.get("FLICKSHARE_NO_NOTIFY", "0") != "1"
     )
+    # When on, senders must complete POST /transfer/request (user Accept, or a trusted
+    # sender_id) and present the issued token on POST /upload. The CLI has nobody to ask,
+    # so it is off unless FLICKSHARE_REQUIRE_APPROVAL=1; the desktop app turns it on.
+    require_approval: bool = field(
+        default_factory=lambda: os.environ.get("FLICKSHARE_REQUIRE_APPROVAL", "0") == "1"
+    )
+    trusted_devices: Set[str] = field(default_factory=set)
+    approval_timeout_s: float = APPROVAL_TIMEOUT_S
+    device_id: str = field(default_factory=lambda: default_device_id())
+    device_name: str = field(default_factory=lambda: get_clean_hostname())
 
 
 config = ReceiverConfig()
@@ -151,13 +186,6 @@ def get_local_ip() -> str:
     return "127.0.0.1"
 
 
-def get_clean_hostname() -> str:
-    """Return a clean, mDNS-safe machine hostname."""
-    raw = socket.gethostname() or "Desktop"
-    cleaned = re.sub(r"[^A-Za-z0-9_-]", "-", raw).strip("-")
-    return cleaned or "Desktop"
-
-
 class MDNSAdvertiser:
     """Manages Zeroconf mDNS registration for _flickshare._tcp.local."""
 
@@ -173,8 +201,10 @@ class MDNSAdvertiser:
         server_fqdn = f"{self.hostname}.local."
         properties = {
             b"version": b"1.0",
+            b"protocol": str(PROTOCOL_VERSION).encode("ascii"),
             b"hostname": self.hostname.encode("utf-8"),
-            b"platform": platform.system().lower().encode("utf-8"),
+            b"device_id": config.device_id.encode("ascii", "replace"),
+            b"platform": platform_name().encode("utf-8"),
             b"endpoint": b"/upload",
         }
         return ServiceInfo(
@@ -540,6 +570,95 @@ def send_catch_notification(
 
 
 # ---------------------------------------------------------------------------
+# Transfer Approval (POST /transfer/request) & One-Time Upload Tokens
+# ---------------------------------------------------------------------------
+
+MAX_REQUEST_FILES = 1000
+
+
+@dataclass
+class SenderInfo:
+    sender_id: str = ""
+    name: str = ""
+    platform: str = ""
+
+
+@dataclass
+class _IssuedToken:
+    client_ip: str
+    sender: SenderInfo
+    expires_at: float
+
+
+@dataclass
+class _PendingApproval:
+    loop: asyncio.AbstractEventLoop
+    future: "asyncio.Future[Tuple[bool, bool]]"
+
+
+_state_lock = threading.Lock()
+_issued_tokens: Dict[str, _IssuedToken] = {}
+_pending_approvals: Dict[str, _PendingApproval] = {}
+
+
+def clean_text(value: Any, limit: int) -> str:
+    """Printable, trimmed, length-capped text from untrusted input (non-strings become '')."""
+    if not isinstance(value, str):
+        return ""
+    return "".join(ch for ch in value if ch.isprintable()).strip()[:limit]
+
+
+def issue_upload_token(client_ip: str, sender: SenderInfo) -> str:
+    token = secrets.token_hex(16)
+    now = time.monotonic()
+    with _state_lock:
+        for key in [k for k, v in _issued_tokens.items() if v.expires_at <= now]:
+            del _issued_tokens[key]
+        _issued_tokens[token] = _IssuedToken(client_ip, sender, now + TOKEN_TTL_S)
+    return token
+
+
+def consume_upload_token(token: str, client_ip: str) -> Optional[SenderInfo]:
+    """Return the sender a token was issued to, invalidating it. None if unknown/expired/other IP."""
+    with _state_lock:
+        issued = _issued_tokens.get(token)
+        if issued is None:
+            return None
+        if issued.expires_at <= time.monotonic():
+            del _issued_tokens[token]
+            return None
+        if issued.client_ip != client_ip:
+            return None
+        del _issued_tokens[token]
+        return issued.sender
+
+
+def resolve_transfer_request(request_id: str, accepted: bool, trust: bool = False) -> bool:
+    """Answer a pending `transfer_request` prompt. Thread-safe; returns False if it already closed."""
+    with _state_lock:
+        pending = _pending_approvals.get(request_id)
+    if pending is None:
+        return False
+
+    def _set_result() -> None:
+        if not pending.future.done():
+            pending.future.set_result((accepted, trust))
+
+    try:
+        pending.loop.call_soon_threadsafe(_set_result)
+    except RuntimeError:  # event loop already closed
+        return False
+    return True
+
+
+def decline_pending_requests() -> int:
+    """Decline every open approval prompt (used before shutdown so held requests end promptly)."""
+    with _state_lock:
+        request_ids = list(_pending_approvals)
+    return sum(resolve_transfer_request(request_id, False) for request_id in request_ids)
+
+
+# ---------------------------------------------------------------------------
 # FastAPI Lifespan & Application Setup
 # ---------------------------------------------------------------------------
 
@@ -628,10 +747,14 @@ class TransferProgressMiddleware:
         scope["flickshare.transfer_id"] = transfer_id
         client = scope.get("client")
         client_ip = client[0] if client else "unknown"
+        app_state = getattr(scope.get("app"), "state", None)
+        cfg: ReceiverConfig = getattr(app_state, "config", config)
 
         total_bytes = 0
         direction: Optional[float] = None
         direction_source = ""
+        token = ""
+        header_sender = SenderInfo()
         for name, value in scope.get("headers") or []:
             if name == b"content-length":
                 try:
@@ -642,6 +765,30 @@ class TransferProgressMiddleware:
                 direction = parse_throw_direction(value)
             elif name == b"x-flickshare-direction-source":
                 direction_source = value.decode("latin-1", "replace")[:16]
+            elif name == b"x-flickshare-token":
+                token = value.decode("latin-1", "replace").strip()
+            elif name == b"x-flickshare-sender-id":
+                header_sender.sender_id = clean_text(value.decode("latin-1", "replace"), 64)
+            elif name == b"x-flickshare-sender-name":
+                header_sender.name = clean_text(unquote(value.decode("latin-1", "replace")), 64)
+            elif name == b"x-flickshare-sender-platform":
+                header_sender.platform = clean_text(value.decode("latin-1", "replace"), 16).lower()
+
+        sender = consume_upload_token(token, client_ip) if token else None
+        if sender is None:
+            if cfg.require_approval:
+                reason = "invalid or expired transfer token" if token else "transfer was not approved"
+                logger.warning("Rejected upload from %s: %s", client_ip, reason)
+                await _send_json(
+                    send,
+                    403,
+                    {"status": "forbidden", "detail": f"Upload rejected: {reason}. Call POST /transfer/request first."},
+                )
+                return
+            sender = header_sender
+        scope["flickshare.sender"] = sender
+        sender_name = sender.name or client_ip
+
         if direction is not None:
             logger.info("Throw from %s aimed %+.0f deg (%s)", client_ip, direction, direction_source or "unknown")
 
@@ -654,6 +801,8 @@ class TransferProgressMiddleware:
             "transfer_started",
             transfer_id=transfer_id,
             client=client_ip,
+            sender_name=sender_name,
+            sender_platform=sender.platform,
             total_bytes=total_bytes,
             direction=direction,
             direction_source=direction_source if direction is not None else "",
@@ -690,6 +839,7 @@ class TransferProgressMiddleware:
                 "transfer_failed",
                 transfer_id=transfer_id,
                 client=client_ip,
+                sender_name=sender_name,
                 error=str(exc) or exc.__class__.__name__,
             )
             raise
@@ -700,8 +850,25 @@ class TransferProgressMiddleware:
                 "transfer_failed",
                 transfer_id=transfer_id,
                 client=client_ip,
+                sender_name=sender_name,
                 error=f"HTTP {status}",
             )
+
+
+async def _send_json(send: Any, status: int, payload: Dict[str, Any]) -> None:
+    body = json.dumps(payload).encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode("ascii")),
+                (b"connection", b"close"),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
 
 
 app.add_middleware(TransferProgressMiddleware)
@@ -729,11 +896,23 @@ input{display:none}progress{width:100%;height:10px;margin-top:1.25rem;accent-col
 <progress id="p" max="1" value="0" hidden></progress><div id="s"></div>
 <script>
 const f=document.getElementById('f'),p=document.getElementById('p'),s=document.getElementById('s');
-f.onchange=()=>{if(!f.files.length)return;const d=new FormData();for(const x of f.files)d.append('files',x);
-const r=new XMLHttpRequest();r.open('POST','/upload');p.hidden=false;p.value=0;s.textContent='Throwing\\u2026';
+let id='';try{id=localStorage.getItem('fsid')||''}catch(e){}
+if(!id){for(let i=0;i<32;i++)id+=Math.floor(Math.random()*16).toString(16);try{localStorage.setItem('fsid',id)}catch(e){}}
+const ua=navigator.userAgent,nm=/iPhone|iPad/.test(ua)?'iPhone browser':/Android/.test(ua)?'Android browser':'Web browser';
+const done=t=>{s.textContent=t;f.value=''};
+f.onchange=async()=>{if(!f.files.length)return;const fl=[...f.files];let tok='';
+s.textContent='Waiting for __HOST__ to accept\\u2026';
+try{const q=await fetch('/transfer/request',{method:'POST',headers:{'Content-Type':'application/json'},
+body:JSON.stringify({sender_id:id,sender_name:nm,sender_platform:'web',files:fl.map(x=>({name:x.name,size:x.size,mime:x.type})),
+total_bytes:fl.reduce((a,x)=>a+x.size,0)})});const j=await q.json().catch(()=>({}));
+if(!q.ok)return done(j.detail||('Not accepted ('+q.status+')'));tok=j.token||''}catch(e){return done('Connection lost')}
+const d=new FormData();for(const x of fl)d.append('files',x);
+const r=new XMLHttpRequest();r.open('POST','/upload');r.setRequestHeader('X-FlickShare-Token',tok);
+r.setRequestHeader('X-FlickShare-Sender-Id',id);r.setRequestHeader('X-FlickShare-Sender-Platform','web');
+r.setRequestHeader('X-FlickShare-Sender-Name',encodeURIComponent(nm));p.hidden=false;p.value=0;s.textContent='Throwing\\u2026';
 r.upload.onprogress=e=>{if(e.lengthComputable)p.value=e.loaded/e.total};
-r.onload=()=>{s.textContent=r.status==200?'Caught! \\u2713':'Failed ('+r.status+')';f.value=''};
-r.onerror=()=>{s.textContent='Connection lost';f.value=''};r.send(d)};
+r.onload=()=>done(r.status==200?'Caught! \\u2713':'Failed ('+r.status+')');
+r.onerror=()=>done('Connection lost');r.send(d)};
 </script></main></body></html>"""
 
 
@@ -751,12 +930,122 @@ async def health_info(request: Request) -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": SERVICE_TYPE,
-        "version": "1.0",
+        "version": "2.0",
+        "protocol": PROTOCOL_VERSION,
         "hostname": get_clean_hostname(),
+        "device_id": cfg.device_id,
+        "device_name": cfg.device_name,
+        "platform": platform_name(),
         "ip": get_local_ip(),
         "port": cfg.port,
+        "requires_approval": cfg.require_approval,
         "save_dir": str(cfg.save_dir.resolve()),
     }
+
+
+@app.post("/transfer/request")
+async def transfer_request(request: Request) -> JSONResponse:
+    """
+    Handshake before `POST /upload`. Trusted senders (or any sender when approvals are off)
+    get a one-time upload token at once; otherwise a `transfer_request` event asks the user and
+    this request is held open until they answer, the sender disconnects, or the timeout passes.
+    """
+    cfg = _get_active_config(request)
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object.")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object.")
+
+    client_ip = request.client.host if request.client else "unknown"
+    sender = SenderInfo(
+        sender_id=clean_text(body.get("sender_id"), 64),
+        name=clean_text(body.get("sender_name"), 64) or client_ip,
+        platform=clean_text(body.get("sender_platform"), 16).lower(),
+    )
+    raw_files = body.get("files") if isinstance(body.get("files"), list) else []
+    files: List[Dict[str, Any]] = []
+    for entry in raw_files[:MAX_REQUEST_FILES]:
+        if not isinstance(entry, dict):
+            continue
+        size = entry.get("size")
+        files.append(
+            {
+                "name": clean_text(entry.get("name"), 255) or "file",
+                "size": int(size) if isinstance(size, (int, float)) and size >= 0 else -1,
+            }
+        )
+    total_bytes = body.get("total_bytes")
+    if not isinstance(total_bytes, (int, float)) or total_bytes < 0:
+        total_bytes = sum(max(f["size"], 0) for f in files)
+
+    trusted = bool(sender.sender_id) and sender.sender_id in cfg.trusted_devices
+    if not cfg.require_approval or trusted:
+        token = issue_upload_token(client_ip, sender)
+        return JSONResponse({"status": "accepted", "token": token, "trusted": trusted})
+
+    request_id = uuid.uuid4().hex[:12]
+    loop = asyncio.get_running_loop()
+    future: "asyncio.Future[Tuple[bool, bool]]" = loop.create_future()
+    with _state_lock:
+        _pending_approvals[request_id] = _PendingApproval(loop, future)
+    logger.info(
+        "Transfer request %s from %s (%s, %s): %d file(s), %s",
+        request_id, sender.name, sender.platform or "?", client_ip, len(raw_files), format_bytes(int(total_bytes)),
+    )
+
+    outcome = "cancelled"
+    trust = False
+    try:
+        emit_event(
+            "transfer_request",
+            request_id=request_id,
+            sender_id=sender.sender_id,
+            sender_name=sender.name,
+            sender_platform=sender.platform,
+            client=client_ip,
+            files=files[:50],
+            file_count=len(raw_files),
+            total_bytes=int(total_bytes),
+            timeout_s=cfg.approval_timeout_s,
+        )
+        deadline = loop.time() + max(cfg.approval_timeout_s, 0.0)
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                outcome = "timeout"
+                break
+            try:
+                accepted, trust = await asyncio.wait_for(asyncio.shield(future), timeout=min(0.5, remaining))
+                outcome = "accepted" if accepted else "declined"
+                break
+            except asyncio.TimeoutError:
+                if await request.is_disconnected():
+                    outcome = "disconnected"
+                    break
+    finally:
+        with _state_lock:
+            _pending_approvals.pop(request_id, None)
+        if outcome not in ("accepted", "declined"):
+            emit_event("transfer_request_closed", request_id=request_id, reason=outcome)
+
+    logger.info("Transfer request %s %s", request_id, outcome)
+    if outcome == "accepted":
+        if trust and sender.sender_id:
+            cfg.trusted_devices.add(sender.sender_id)
+        token = issue_upload_token(client_ip, sender)
+        return JSONResponse({"status": "accepted", "token": token, "trusted": bool(trust)})
+    if outcome == "declined":
+        return JSONResponse(
+            status_code=403, content={"status": "declined", "detail": f"{cfg.device_name} declined the files"}
+        )
+    # Retry-After stops OkHttp from silently re-sending (and re-prompting) on 408.
+    return JSONResponse(
+        status_code=408,
+        content={"status": "timeout", "detail": f"No response from {cfg.device_name}"},
+        headers={"Retry-After": str(int(APPROVAL_TIMEOUT_S))},
+    )
 
 
 async def _stream_upload_to_disk(upload: UploadFile, save_dir: Path) -> Dict[str, Any]:
@@ -877,10 +1166,13 @@ async def upload_endpoint(
 
     primary = saved_entries[0]
     client = request.client
+    client_ip = client.host if client else "unknown"
+    sender = request.scope.get("flickshare.sender")
     emit_event(
         "transfer_completed",
         transfer_id=request.scope.get("flickshare.transfer_id"),
-        client=client.host if client else "unknown",
+        client=client_ip,
+        sender_name=(sender.name if isinstance(sender, SenderInfo) and sender.name else client_ip),
         files=[dict(entry) for entry in saved_entries],
         total_bytes=total_bytes,
         duration_ms=round(total_duration_ms, 2),

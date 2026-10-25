@@ -1,4 +1,4 @@
-# FlickShare Desktop v1.1.0
+# FlickShare Desktop v1.1.1
 
 Share files between any of your devices: phone to PC, PC to phone, PC to PC, and phone to phone. Everything stays on your local Wi-Fi.
 
@@ -10,6 +10,10 @@ Share files between any of your devices: phone to PC, PC to phone, PC to PC, and
 | `FlickShare-windows.zip` | Folder version. Unzip and run `FlickShare.exe` inside. Starts faster. |
 
 Windows 10/11, 64-bit. The exe isn't code-signed, so SmartScreen may warn: click **More info → Run anyway**.
+
+## Fixed in 1.1.1
+
+- The **incoming files** popup now closes after you click **Accept** or **Decline**, press Esc, or close it. Before, it stayed open even though your answer was sent.
 
 ## New in 1.1.0
 

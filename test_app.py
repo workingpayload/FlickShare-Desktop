@@ -433,3 +433,69 @@ def test_file_sender_handshake_and_upload_end_to_end(live_receiver, tmp_path: Pa
     assert prompts[0]["sender_name"] == "Test Laptop" and prompts[0]["file_count"] == 2
     assert prompts[0]["total_bytes"] == sender.total_bytes
     assert not (inbox / "café ☕_1.txt").exists()  # declined send wrote nothing
+
+
+@pytest.mark.parametrize(
+    "action, expected",
+    [
+        ("accept", ("r1", True, True)),
+        ("decline", ("r1", False, False)),
+        ("escape", ("r1", False, False)),
+        ("close", ("r1", False, False)),
+        ("timeout", ("r1", False, False)),
+    ],
+)
+def test_approval_dialog_closes_after_any_answer(monkeypatch, action, expected):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication, QPushButton
+
+    from flickshare_app.approval_dialog import ApprovalDialog
+
+    _app = QApplication.instance() or QApplication([])
+    dialog = ApprovalDialog({"request_id": "r1", "sender_id": "s1", "sender_name": "Phone", "file_count": 1})
+    decisions = []
+    dialog.decided.connect(lambda *args: decisions.append(args))
+    destroyed = []
+    dialog.destroyed.connect(lambda: destroyed.append(True))
+    dialog.show()
+    buttons = {b.text(): b for b in dialog.findChildren(QPushButton)}
+
+    if action == "accept":
+        dialog.trust_box.setChecked(True)
+        buttons["Accept"].click()
+    elif action == "decline":
+        buttons["Decline"].click()
+    elif action == "escape":
+        QTest.keyClick(dialog, Qt.Key.Key_Escape)
+    elif action == "close":
+        dialog.close()
+    else:
+        dialog._remaining = 1
+        dialog._tick()
+
+    assert decisions == [expected]
+    assert not dialog.isVisible()
+    QApplication.sendPostedEvents(None, 0)  # deliver DeferredDelete
+    assert destroyed == [True]
+
+
+def test_approval_dialog_dismiss_closes_without_answer(monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    from flickshare_app.approval_dialog import ApprovalDialog
+
+    _app = QApplication.instance() or QApplication([])
+    dialog = ApprovalDialog({"request_id": "r2", "sender_name": "Phone"})
+    decisions = []
+    dialog.decided.connect(lambda *args: decisions.append(args))
+    destroyed = []
+    dialog.destroyed.connect(lambda: destroyed.append(True))
+    dialog.show()
+    dialog.dismiss()
+    assert decisions == []
+    assert not dialog.isVisible()
+    QApplication.sendPostedEvents(None, 0)  # deliver DeferredDelete
+    assert destroyed == [True]

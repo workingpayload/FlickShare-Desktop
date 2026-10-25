@@ -103,12 +103,15 @@ class ApprovalDialog(QDialog):
         else:
             self._update_countdown()
 
-    def _finish(self, accepted: bool) -> None:
+    def _decide(self, accepted: bool) -> None:
         if self._done:
             return
         self._done = True
         self._timer.stop()
         self.decided.emit(self.request_id, accepted, accepted and self.trust_box.isChecked())
+
+    def _finish(self, accepted: bool) -> None:
+        self._decide(accepted)
         self.close()
 
     def dismiss(self) -> None:
@@ -118,11 +121,10 @@ class ApprovalDialog(QDialog):
         self.close()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
-        if not self._done:
-            self._done = True
-            self._timer.stop()
-            self.decided.emit(self.request_id, False, False)
+        self._decide(False)
+        # QDialog.closeEvent calls reject() and ignores the close if the dialog is still visible.
         super().closeEvent(event)
 
-    def reject(self) -> None:  # Esc key
-        self._finish(False)
+    def reject(self) -> None:  # Esc key, and QDialog.closeEvent
+        self._decide(False)
+        super().reject()
